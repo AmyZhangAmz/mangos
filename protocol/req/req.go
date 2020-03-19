@@ -53,8 +53,6 @@ type context struct {
 	sendMsg    *protocol.Message // messaging waiting for send
 	lastPipe   *pipe             // last pipe used for transmit
 	reqID      uint32            // request ID
-	sendID     uint32            // sent id (cleared after first send)
-	recvID     uint32            // recv id (set after first send)
 	recvWait   bool              // true if a thread is blocked in RecvMsg
 	bestEffort bool              // if true, don't block waiting in send
 	queued     bool              // true if we need to send a message
@@ -78,15 +76,15 @@ func (s *socket) send() {
 		s.sendq = s.sendq[1:]
 		c.queued = false
 
-		if c.sendID != 0 {
-			c.reqMsg = c.sendMsg
+		var m *protocol.Message
+		if m = c.sendMsg; m != nil {
+			c.reqMsg = m
 			c.sendMsg = nil
-			c.recvID = c.sendID
-			s.ctxByID[c.recvID] = c
-			c.sendID = 0
+			s.ctxByID[c.reqID] = c
 			c.cond.Broadcast()
+		} else {
+			m = c.reqMsg
 		}
-		m := c.reqMsg
 		m.Clone()
 		p := s.readyq[0]
 		s.readyq = s.readyq[1:]
@@ -106,7 +104,7 @@ func (p *pipe) sendCtx(c *context, m *protocol.Message) {
 	s := p.s
 
 	// Send this message.  If an error occurs, we examine the
-	// error.  If it is ErrClosed, we don't schedule ourself.
+	// error.  If it is ErrClosed, we don't schedule our self.
 	if err := p.p.SendMsg(m); err != nil {
 		m.Free()
 		if err == protocol.ErrClosed {
@@ -215,8 +213,6 @@ func (c *context) cancel() {
 		c.recvTimer.Stop()
 		c.recvTimer = nil
 	}
-	c.sendID = 0
-	c.recvID = 0
 	c.cond.Broadcast()
 }
 
@@ -238,11 +234,12 @@ func (c *context) SendMsg(m *protocol.Message) error {
 	}
 
 	c.cancel() // this cancels any pending send or recv calls
+	c.unscheduleSend()
 
 	c.reqID = id
-	s.ctxByID[id] = c
-	c.unscheduleSend()
 	c.queued = true
+	c.sendMsg = m
+
 	s.sendq = append(s.sendq, c)
 
 	if c.bestEffort {
@@ -250,19 +247,15 @@ func (c *context) SendMsg(m *protocol.Message) error {
 		// reqMsg, and schedule it as a send.  No waiting.
 		// This means that if the message cannot be delivered
 		// immediately, it will still get a chance later.
-		c.reqMsg = m
-		c.recvID = id
 		s.send()
 		return nil
 	}
 
 	expired := false
-	c.sendID = id
-	c.sendMsg = m
 	if c.sendExpire > 0 {
 		c.sendTimer = time.AfterFunc(c.sendExpire, func() {
 			s.Lock()
-			if c.sendID == id {
+			if c.sendMsg == m {
 				expired = true
 				c.cancel() // also does a wake up
 			}
@@ -276,10 +269,11 @@ func (c *context) SendMsg(m *protocol.Message) error {
 	// It is responsible for providing the blocking semantic and
 	// ultimately back-pressure.  Note that we will "continue" if
 	// the send is canceled by a subsequent send.
-	for c.sendID == id {
+	for c.sendMsg == m && !expired && !c.closed {
 		c.cond.Wait()
 	}
 	if c.sendMsg == m {
+		c.unscheduleSend()
 		c.sendMsg = nil
 		if expired {
 			return protocol.ErrSendTimeout
@@ -298,17 +292,17 @@ func (c *context) RecvMsg() (*protocol.Message, error) {
 	if s.closed || c.closed {
 		return nil, protocol.ErrClosed
 	}
-	if c.recvWait || c.recvID == 0 {
+	if c.recvWait || c.reqID == 0 {
 		return nil, protocol.ErrProtoState
 	}
 	c.recvWait = true
-	id := c.recvID
+	id := c.reqID
 	expired := false
 
 	if c.recvExpire > 0 {
 		c.recvTimer = time.AfterFunc(c.recvExpire, func() {
 			s.Lock()
-			if c.recvID == id {
+			if c.reqID == id {
 				expired = true
 				c.cancel()
 			}
@@ -316,12 +310,12 @@ func (c *context) RecvMsg() (*protocol.Message, error) {
 		})
 	}
 
-	for id == c.recvID && c.repMsg == nil {
+	for id == c.reqID && c.repMsg == nil {
 		c.cond.Wait()
 	}
 
 	m := c.repMsg
-	c.recvID = 0
+	c.reqID = 0
 	c.repMsg = nil
 	c.recvWait = false
 	c.cond.Broadcast()
